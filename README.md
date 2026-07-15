@@ -1,8 +1,11 @@
 # Xiaomi Pen Status
 
 Small Qt tray utility for stylus power-state attributes exported by
-`qcom_battmgr`. The UI follows the system locale and supports Chinese and
-English. Set `XIAOMI_PEN_LANG=zh` or `XIAOMI_PEN_LANG=en` to override it.
+`qcom_battmgr`. It reconstructs the detected pen address from `pen_mac_h` and
+`pen_mac_l`, checks that exact address through BlueZ when the pen is docked,
+and starts a short LE discovery/pair/connect attempt while the detected pen is
+pairable. The UI follows the system locale and supports Chinese and English.
+Set `XIAOMI_PEN_LANG=zh` or `XIAOMI_PEN_LANG=en` to override it.
 
 Build:
 

@@ -1,6 +1,13 @@
 #include <QAction>
 #include <QApplication>
 #include <QCloseEvent>
+#include <QDateTime>
+#include <QDBusConnection>
+#include <QDBusInterface>
+#include <QDBusMetaType>
+#include <QDBusObjectPath>
+#include <QDBusReply>
+#include <QDBusVariant>
 #include <QDir>
 #include <QFile>
 #include <QFrame>
@@ -16,6 +23,7 @@
 #include <QPainter>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QScreen>
 #include <QStyleHints>
 #include <QSystemTrayIcon>
 #include <QTimer>
@@ -24,8 +32,72 @@
 
 #include <optional>
 
+using BluezInterfaceMap = QMap<QString, QVariantMap>;
+using BluezManagedObjects = QMap<QDBusObjectPath, BluezInterfaceMap>;
+
+Q_DECLARE_METATYPE(BluezInterfaceMap)
+Q_DECLARE_METATYPE(BluezManagedObjects)
+
 static constexpr const char *kDefaultSysfs =
 	"/sys/devices/platform/pmic-glink/pmic_glink.power-supply.0/xiaomi";
+
+struct BluetoothState {
+	bool serviceAvailable = false;
+	bool powered = false;
+	bool discovering = false;
+	bool deviceFound = false;
+	bool paired = false;
+	bool trusted = false;
+	bool connected = false;
+	QString adapterPath;
+	QString devicePath;
+};
+
+static BluetoothState readBluetoothState(const QString &address)
+{
+	static const bool registered = []() {
+		qDBusRegisterMetaType<BluezInterfaceMap>();
+		qDBusRegisterMetaType<BluezManagedObjects>();
+		return true;
+	}();
+	Q_UNUSED(registered);
+
+	BluetoothState state;
+	QDBusInterface manager(QStringLiteral("org.bluez"), QStringLiteral("/"),
+				       QStringLiteral("org.freedesktop.DBus.ObjectManager"),
+				       QDBusConnection::systemBus());
+	if (!manager.isValid())
+		return state;
+
+	const QDBusReply<BluezManagedObjects> reply = manager.call(QStringLiteral("GetManagedObjects"));
+	if (!reply.isValid())
+		return state;
+	state.serviceAvailable = true;
+
+	const BluezManagedObjects objects = reply.value();
+	for (auto object = objects.cbegin(); object != objects.cend(); ++object) {
+		const auto adapter = object.value().constFind(QStringLiteral("org.bluez.Adapter1"));
+		if (adapter != object.value().cend() && state.adapterPath.isEmpty()) {
+			state.adapterPath = object.key().path();
+			state.powered = adapter->value(QStringLiteral("Powered")).toBool();
+			state.discovering = adapter->value(QStringLiteral("Discovering")).toBool();
+		}
+
+		const auto device = object.value().constFind(QStringLiteral("org.bluez.Device1"));
+		if (device == object.value().cend())
+			continue;
+		if (device->value(QStringLiteral("Address")).toString().compare(
+				address, Qt::CaseInsensitive) != 0)
+			continue;
+
+		state.deviceFound = true;
+		state.devicePath = object.key().path();
+		state.paired = device->value(QStringLiteral("Paired")).toBool();
+		state.trusted = device->value(QStringLiteral("Trusted")).toBool();
+		state.connected = device->value(QStringLiteral("Connected")).toBool();
+	}
+	return state;
+}
 
 static std::optional<int> readInt(const QString &path)
 {
@@ -38,6 +110,19 @@ static std::optional<int> readInt(const QString &path)
 	if (!ok)
 		return std::nullopt;
 
+	return value;
+}
+
+static std::optional<quint32> readHex32(const QString &path)
+{
+	QFile file(path);
+	if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
+		return std::nullopt;
+
+	bool ok = false;
+	const quint32 value = QString::fromUtf8(file.readAll()).trimmed().toUInt(&ok, 16);
+	if (!ok)
+		return std::nullopt;
 	return value;
 }
 
@@ -237,6 +322,8 @@ struct PenState {
 	std::optional<int> txSs;
 	std::optional<int> txIout;
 	std::optional<int> txVout;
+	std::optional<quint32> macLow;
+	std::optional<quint32> macHigh;
 
 	bool valid() const
 	{
@@ -256,6 +343,20 @@ struct PenState {
 	bool batteryKnown() const
 	{
 		return soc.has_value() && *soc >= 0 && *soc <= 100;
+	}
+
+	std::optional<QString> macAddress() const
+	{
+		if (!macLow || !macHigh || (*macLow == 0 && *macHigh == 0))
+			return std::nullopt;
+		const QString hex = QStringLiteral("%1%2")
+			.arg(*macHigh & 0xffff, 4, 16, QLatin1Char('0'))
+			.arg(*macLow, 8, 16, QLatin1Char('0'))
+			.toUpper();
+		QStringList octets;
+		for (int offset = 0; offset < hex.size(); offset += 2)
+			octets.append(hex.mid(offset, 2));
+		return octets.join(QLatin1Char(':'));
 	}
 };
 
@@ -320,7 +421,7 @@ public:
 
 		setWindowTitle(trText("手写笔状态", "Stylus Status"));
 		setWindowIcon(transparentWindowIcon());
-		setFixedSize(500, 540);
+		setFixedSize(500, 600);
 
 		statusDot = new QLabel;
 		statusDot->setFixedSize(12, 12);
@@ -358,6 +459,8 @@ public:
 		addDebugRow(debugLayout, 2, QStringLiteral("tx_vout"), &txVoutValue);
 		addDebugRow(debugLayout, 3, QStringLiteral("hall3 / hall4"), &hallValue);
 		addDebugRow(debugLayout, 4, QStringLiteral("pen_place_err"), &placeErrValue);
+		addDebugRow(debugLayout, 5, QStringLiteral("pen_mac"), &macValue);
+		addDebugRow(debugLayout, 6, QStringLiteral("refresh_rate"), &refreshRateValue);
 
 		auto *refreshButton = new QPushButton(trText("刷新", "Refresh"));
 		connect(refreshButton, &QPushButton::clicked, this, &PenStatusWindow::refresh);
@@ -416,6 +519,11 @@ public:
 		refresh();
 	}
 
+	~PenStatusWindow() override
+	{
+		stopAutoDiscovery();
+	}
+
 	void showWindow()
 	{
 		showNormal();
@@ -443,6 +551,9 @@ protected:
 	}
 
 private:
+	static constexpr qint64 kAutoConnectWindowMs = 30000;
+	static constexpr qint64 kConnectionGraceMs = 10000;
+
 	void updateTheme()
 	{
 		const bool dark = isDarkMode();
@@ -468,12 +579,129 @@ private:
 		state.txSs = readInt(sysfsBase + QStringLiteral("/pen_tx_ss"));
 		state.txIout = readInt(sysfsBase + QStringLiteral("/tx_iout"));
 		state.txVout = readInt(sysfsBase + QStringLiteral("/tx_vout"));
+		state.macLow = readHex32(sysfsBase + QStringLiteral("/pen_mac_l"));
+		state.macHigh = readHex32(sysfsBase + QStringLiteral("/pen_mac_h"));
 		return state;
+	}
+
+	void stopAutoDiscovery()
+	{
+		if (discoveryStartedByUs && !discoveryAdapterPath.isEmpty()) {
+			QDBusInterface adapter(QStringLiteral("org.bluez"), discoveryAdapterPath,
+					       QStringLiteral("org.bluez.Adapter1"),
+					       QDBusConnection::systemBus());
+			adapter.call(QDBus::NoBlock, QStringLiteral("StopDiscovery"));
+		}
+		discoveryStartedByUs = false;
+		discoveryAdapterPath.clear();
+	}
+
+	void resetAutoConnect()
+	{
+		stopAutoDiscovery();
+		autoConnectMac.clear();
+		autoConnectDeadline = 0;
+		autoConnectAttemptStarted = 0;
+		nextBluetoothAction = 0;
+	}
+
+	void serviceAutoConnect(const std::optional<QString> &mac,
+				const BluetoothState &state)
+	{
+		if (!mac) {
+			resetAutoConnect();
+			return;
+		}
+
+		const qint64 now = QDateTime::currentMSecsSinceEpoch();
+		if (autoConnectMac.compare(*mac, Qt::CaseInsensitive) != 0) {
+			resetAutoConnect();
+			autoConnectMac = *mac;
+			autoConnectDeadline = now + kAutoConnectWindowMs;
+		}
+		if (state.connected) {
+			if (state.paired && !state.trusted && !state.devicePath.isEmpty())
+				setDeviceTrusted(state.devicePath);
+			stopAutoDiscovery();
+			return;
+		}
+		if (now >= autoConnectDeadline) {
+			stopAutoDiscovery();
+			return;
+		}
+		if (!state.serviceAvailable || !state.powered || state.adapterPath.isEmpty())
+			return;
+
+		if (!state.deviceFound) {
+			if (state.discovering && autoConnectAttemptStarted == 0)
+				autoConnectAttemptStarted = now;
+			if (now < nextBluetoothAction)
+				return;
+			if (!state.discovering) {
+				QDBusInterface adapter(QStringLiteral("org.bluez"), state.adapterPath,
+						       QStringLiteral("org.bluez.Adapter1"),
+						       QDBusConnection::systemBus());
+				QVariantMap filter;
+				filter.insert(QStringLiteral("Transport"), QStringLiteral("le"));
+				adapter.call(QDBus::NoBlock, QStringLiteral("SetDiscoveryFilter"), filter);
+				adapter.call(QDBus::NoBlock, QStringLiteral("StartDiscovery"));
+				discoveryStartedByUs = true;
+				discoveryAdapterPath = state.adapterPath;
+				if (autoConnectAttemptStarted == 0)
+					autoConnectAttemptStarted = now;
+			}
+			nextBluetoothAction = now + 2000;
+			return;
+		}
+
+		stopAutoDiscovery();
+		if (now < nextBluetoothAction || state.devicePath.isEmpty())
+			return;
+		QDBusInterface device(QStringLiteral("org.bluez"), state.devicePath,
+				      QStringLiteral("org.bluez.Device1"),
+				      QDBusConnection::systemBus());
+		if (!state.paired) {
+			device.call(QDBus::NoBlock, QStringLiteral("Pair"));
+		} else {
+			if (!state.trusted)
+				setDeviceTrusted(state.devicePath);
+			device.call(QDBus::NoBlock, QStringLiteral("Connect"));
+		}
+		if (autoConnectAttemptStarted == 0)
+			autoConnectAttemptStarted = now;
+		nextBluetoothAction = now + 5000;
+	}
+
+	static void setDeviceTrusted(const QString &devicePath)
+	{
+		QDBusInterface properties(QStringLiteral("org.bluez"), devicePath,
+					  QStringLiteral("org.freedesktop.DBus.Properties"),
+					  QDBusConnection::systemBus());
+		properties.call(QDBus::NoBlock, QStringLiteral("Set"),
+				QStringLiteral("org.bluez.Device1"),
+				QStringLiteral("Trusted"),
+				QVariant::fromValue(QDBusVariant(QVariant(true))));
+	}
+
+	bool autoConnectPending() const
+	{
+		const qint64 now = QDateTime::currentMSecsSinceEpoch();
+		return autoConnectAttemptStarted > 0 && now < autoConnectDeadline &&
+		       now - autoConnectAttemptStarted < kConnectionGraceMs;
 	}
 
 	void refresh()
 	{
 		const PenState state = readState();
+		const std::optional<QString> mac = state.macAddress();
+		const BluetoothState bluetooth = mac ? readBluetoothState(*mac) : BluetoothState{};
+		serviceAutoConnect(mac, bluetooth);
+		QScreen *screen = QGuiApplication::primaryScreen();
+		const qreal refreshRate = screen ? screen->refreshRate() : 0.0;
+		const bool rateKnown = refreshRate > 1.0;
+		const bool rateSupported = rateKnown &&
+			(qAbs(refreshRate - 60.0) < 1.0 || qAbs(refreshRate - 120.0) < 1.0);
+		QStringList warnings;
 
 		if (!state.valid()) {
 			applyStatus(VisualState::Unknown, QStringLiteral("#9b1c1c"),
@@ -482,18 +710,14 @@ private:
 			connectedNotified = false;
 			batteryBar->setValue(0);
 			batteryNumber->setText(QStringLiteral("--"));
-			warningLabel->setText(trText("请确认 qcom_battmgr 已加载并导出了 Xiaomi 属性。",
-						     "Check that qcom_battmgr is loaded and exporting Xiaomi attributes."));
-			updateDebug(state);
-			return;
-		}
-
-		if (state.misplaced()) {
+			warnings.append(trText("请确认 qcom_battmgr 已加载并导出了 Xiaomi 属性。",
+					       "Check that qcom_battmgr is loaded and exporting Xiaomi attributes."));
+		} else if (state.misplaced()) {
 			applyStatus(VisualState::Misplaced, QStringLiteral("#c66a00"),
 				    trText("未放好", "Not seated"),
 				    trText("请重新放置手写笔", "Reseat the stylus"));
-			warningLabel->setText(trText("手写笔没有正确贴合充电位置。",
-						     "The stylus is not aligned with the charging position."));
+			warnings.append(trText("手写笔没有正确贴合充电位置。",
+					       "The stylus is not aligned with the charging position."));
 			notifyOnce(trText("手写笔未放好", "Stylus not seated"),
 				   trText("请重新放置手写笔。", "Please reseat the stylus."));
 			connectedNotified = false;
@@ -501,32 +725,82 @@ private:
 			applyStatus(VisualState::Placed, QStringLiteral("#1f7a5c"),
 				    trText("已放回", "Docked"),
 				    trText("手写笔在充电位置", "Stylus is in the charging position"));
-			warningLabel->clear();
 			misplacedNotified = false;
 		} else {
 			applyStatus(VisualState::Detached, QStringLiteral("#3867a6"),
 				    trText("已取下", "Detached"),
 				    trText("手写笔未在充电位置", "Stylus is away from the charging position"));
-			warningLabel->clear();
 			misplacedNotified = false;
 			connectedNotified = false;
 		}
 
-		if (state.batteryKnown()) {
+		if (state.valid() && state.batteryKnown()) {
 			batteryBar->setValue(*state.soc);
 			batteryNumber->setText(QStringLiteral("%1%").arg(*state.soc));
 			if (state.placed() && !state.misplaced() && !connectedNotified) {
-				tray->showMessage(trText("手写笔已连接", "Stylus connected"),
-						  trText("当前电量 %1%", "Battery %1%").arg(*state.soc),
-						  QSystemTrayIcon::Information, 5000);
-				connectedNotified = true;
+				if (mac && !bluetooth.connected) {
+					if (!autoConnectPending()) {
+						tray->showMessage(
+							trText("手写笔蓝牙未连接", "Stylus Bluetooth disconnected"),
+							bluetoothAdvice(*mac, bluetooth),
+							QSystemTrayIcon::Warning, 7000);
+						connectedNotified = true;
+					}
+				} else {
+					tray->showMessage(trText("手写笔已连接", "Stylus connected"),
+							  trText("当前电量 %1%", "Battery %1%").arg(*state.soc),
+							  QSystemTrayIcon::Information, 5000);
+					connectedNotified = true;
+				}
 			}
-		} else {
+		} else if (state.valid()) {
 			batteryBar->setValue(0);
 			batteryNumber->setText(QStringLiteral("--"));
 		}
 
-		updateDebug(state);
+		if (mac && !bluetooth.connected) {
+			if (autoConnectPending())
+				warnings.append(trText("正在尝试自动配对并连接手写笔 %1。",
+						       "Trying to pair and connect stylus %1 automatically.")
+						.arg(*mac));
+			else
+				warnings.append(bluetoothAdvice(*mac, bluetooth));
+		}
+		if (!rateKnown) {
+			refreshRateNotified = false;
+		} else if (!rateSupported) {
+			warnings.append(trText("手写笔仅在 60 Hz 或 120 Hz 刷新率下工作。",
+					   "The stylus works only at 60 Hz or 120 Hz."));
+			if (!refreshRateNotified && tray->isVisible()) {
+				tray->showMessage(
+					trText("当前刷新率不支持手写笔", "Refresh rate does not support the stylus"),
+					trText("当前为 %1 Hz。请切换到 60 Hz 或 120 Hz。",
+					       "The display is at %1 Hz. Switch to 60 Hz or 120 Hz.")
+						.arg(refreshRate, 0, 'f', 0),
+					QSystemTrayIcon::Warning, 7000);
+				refreshRateNotified = true;
+			}
+		} else {
+			refreshRateNotified = false;
+		}
+
+		warningLabel->setText(warnings.join(QLatin1Char('\n')));
+		updateDebug(state, mac, refreshRate);
+	}
+
+	static QString bluetoothAdvice(const QString &mac, const BluetoothState &state)
+	{
+		if (!state.serviceAvailable || !state.powered)
+			return trText("已检测到手写笔 %1，但系统蓝牙未开启。请开启蓝牙并连接此设备。",
+				      "Stylus %1 was detected, but Bluetooth is off. Turn it on and connect this device.")
+				.arg(mac);
+		if (!state.deviceFound)
+			return trText("已检测到手写笔 %1，但系统蓝牙中未找到此设备。请配对并连接。",
+				      "Stylus %1 was detected, but is not known to BlueZ. Pair and connect it.")
+				.arg(mac);
+		return trText("已检测到手写笔 %1，但尚未通过蓝牙连接。请在系统蓝牙设置中连接。",
+			      "Stylus %1 was detected, but is not connected. Connect it in the system Bluetooth settings.")
+			.arg(mac);
 	}
 
 	void applyStatus(VisualState visualState, const QString &color, const QString &state,
@@ -548,13 +822,18 @@ private:
 		misplacedNotified = true;
 	}
 
-	void updateDebug(const PenState &state)
+	void updateDebug(const PenState &state, const std::optional<QString> &mac,
+			 qreal refreshRate)
 	{
 		txSsValue->setText(valueText(state.txSs));
 		txIoutValue->setText(valueText(state.txIout));
 		txVoutValue->setText(valueText(state.txVout));
 		hallValue->setText(QStringLiteral("%1 / %2").arg(valueText(state.hall3), valueText(state.hall4)));
 		placeErrValue->setText(valueText(state.placeErr));
+		macValue->setText(mac.value_or(QStringLiteral("-")));
+		refreshRateValue->setText(refreshRate > 1.0
+			? QStringLiteral("%1 Hz").arg(refreshRate, 0, 'f', 0)
+			: QStringLiteral("-"));
 	}
 
 	static QString valueText(std::optional<int> value)
@@ -572,6 +851,8 @@ private:
 	QLabel *batteryNumber = nullptr;
 	QLabel *batteryCaption = nullptr;
 	QLabel *warningLabel = nullptr;
+	QLabel *refreshRateValue = nullptr;
+	QLabel *macValue = nullptr;
 	QLabel *txSsValue = nullptr;
 	QLabel *txIoutValue = nullptr;
 	QLabel *txVoutValue = nullptr;
@@ -586,6 +867,13 @@ private:
 	QTimer *timer = nullptr;
 	bool misplacedNotified = false;
 	bool connectedNotified = false;
+	bool refreshRateNotified = false;
+	bool discoveryStartedByUs = false;
+	QString autoConnectMac;
+	QString discoveryAdapterPath;
+	qint64 autoConnectDeadline = 0;
+	qint64 autoConnectAttemptStarted = 0;
+	qint64 nextBluetoothAction = 0;
 	bool allowQuit = false;
 };
 
