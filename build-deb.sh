@@ -2,7 +2,7 @@
 set -eu
 
 APP=xiaomi-pen-status
-VERSION=0.2.1
+VERSION=0.2.2
 ARCH="$(dpkg --print-architecture)"
 ROOT="$(pwd)"
 PKGROOT="$(mktemp -d)"

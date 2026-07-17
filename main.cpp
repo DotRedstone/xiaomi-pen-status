@@ -51,7 +51,33 @@ struct BluetoothState {
 	bool connected = false;
 	QString adapterPath;
 	QString devicePath;
+	QString firmwareRevision;
+	QString softwareRevision;
 };
+
+static QByteArray readGattValue(const QString &path, const QVariantMap &properties)
+{
+	QByteArray value = properties.value(QStringLiteral("Value")).toByteArray();
+	if (!value.isEmpty())
+		return value;
+
+	QDBusInterface characteristic(QStringLiteral("org.bluez"), path,
+					 QStringLiteral("org.bluez.GattCharacteristic1"),
+					 QDBusConnection::systemBus());
+	if (!characteristic.isValid())
+		return {};
+	const QDBusReply<QByteArray> reply = characteristic.call(
+		QStringLiteral("ReadValue"), QVariantMap{});
+	return reply.isValid() ? reply.value() : QByteArray{};
+}
+
+static QString decodeGattText(QByteArray value)
+{
+	const qsizetype terminator = value.indexOf('\0');
+	if (terminator >= 0)
+		value.truncate(terminator);
+	return QString::fromUtf8(value).trimmed();
+}
 
 static BluetoothState readBluetoothState(const QString &address)
 {
@@ -95,6 +121,29 @@ static BluetoothState readBluetoothState(const QString &address)
 		state.paired = device->value(QStringLiteral("Paired")).toBool();
 		state.trusted = device->value(QStringLiteral("Trusted")).toBool();
 		state.connected = device->value(QStringLiteral("Connected")).toBool();
+	}
+
+	if (!state.connected || state.devicePath.isEmpty())
+		return state;
+	const QString devicePrefix = state.devicePath + QLatin1Char('/');
+	for (auto object = objects.cbegin(); object != objects.cend(); ++object) {
+		if (!object.key().path().startsWith(devicePrefix))
+			continue;
+		const auto characteristic = object.value().constFind(
+			QStringLiteral("org.bluez.GattCharacteristic1"));
+		if (characteristic == object.value().cend())
+			continue;
+		const QString uuid = characteristic->value(QStringLiteral("UUID")).toString();
+		if (uuid.compare(QStringLiteral("00002a26-0000-1000-8000-00805f9b34fb"),
+				 Qt::CaseInsensitive) == 0) {
+			state.firmwareRevision = decodeGattText(
+				readGattValue(object.key().path(), *characteristic));
+		} else if (uuid.compare(
+				   QStringLiteral("00002a28-0000-1000-8000-00805f9b34fb"),
+				   Qt::CaseInsensitive) == 0) {
+			state.softwareRevision = decodeGattText(
+				readGattValue(object.key().path(), *characteristic));
+		}
 	}
 	return state;
 }
@@ -461,6 +510,7 @@ public:
 		addDebugRow(debugLayout, 4, QStringLiteral("pen_place_err"), &placeErrValue);
 		addDebugRow(debugLayout, 5, QStringLiteral("pen_mac"), &macValue);
 		addDebugRow(debugLayout, 6, QStringLiteral("refresh_rate"), &refreshRateValue);
+		addDebugRow(debugLayout, 7, QStringLiteral("firmware / software"), &versionValue);
 
 		auto *refreshButton = new QPushButton(trText("刷新", "Refresh"));
 		connect(refreshButton, &QPushButton::clicked, this, &PenStatusWindow::refresh);
@@ -785,7 +835,7 @@ private:
 		}
 
 		warningLabel->setText(warnings.join(QLatin1Char('\n')));
-		updateDebug(state, mac, refreshRate);
+		updateDebug(state, mac, bluetooth, refreshRate);
 	}
 
 	static QString bluetoothAdvice(const QString &mac, const BluetoothState &state)
@@ -823,7 +873,7 @@ private:
 	}
 
 	void updateDebug(const PenState &state, const std::optional<QString> &mac,
-			 qreal refreshRate)
+			 const BluetoothState &bluetooth, qreal refreshRate)
 	{
 		txSsValue->setText(valueText(state.txSs));
 		txIoutValue->setText(valueText(state.txIout));
@@ -834,6 +884,13 @@ private:
 		refreshRateValue->setText(refreshRate > 1.0
 			? QStringLiteral("%1 Hz").arg(refreshRate, 0, 'f', 0)
 			: QStringLiteral("-"));
+		QStringList versions;
+		if (!bluetooth.firmwareRevision.isEmpty())
+			versions.append(QStringLiteral("FW %1").arg(bluetooth.firmwareRevision));
+		if (!bluetooth.softwareRevision.isEmpty())
+			versions.append(QStringLiteral("SW %1").arg(bluetooth.softwareRevision));
+		versionValue->setText(versions.isEmpty()
+			? QStringLiteral("-") : versions.join(QStringLiteral(" / ")));
 	}
 
 	static QString valueText(std::optional<int> value)
@@ -852,6 +909,7 @@ private:
 	QLabel *batteryCaption = nullptr;
 	QLabel *warningLabel = nullptr;
 	QLabel *refreshRateValue = nullptr;
+	QLabel *versionValue = nullptr;
 	QLabel *macValue = nullptr;
 	QLabel *txSsValue = nullptr;
 	QLabel *txIoutValue = nullptr;
