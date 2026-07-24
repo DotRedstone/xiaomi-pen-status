@@ -23,6 +23,11 @@ Run:
 Closing the window keeps the tray icon running. Use the tray menu to show the
 window again or quit.
 
+When the detected pen is a connected Xiaomi Focus Pen Pro, the window also
+shows five pinch-force levels. The selected level is stored per user and is
+applied after each Bluetooth reconnection, once the touch service has completed
+its Focus Pen Pro initialization.
+
 Optional local desktop integration:
 
 ```sh

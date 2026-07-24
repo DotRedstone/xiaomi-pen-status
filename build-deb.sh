@@ -2,7 +2,7 @@
 set -eu
 
 APP=xiaomi-pen-status
-VERSION=0.2.2
+VERSION=0.2.3
 ARCH="$(dpkg --print-architecture)"
 ROOT="$(pwd)"
 PKGROOT="$(mktemp -d)"
@@ -34,7 +34,7 @@ Version: ${VERSION}
 Section: utils
 Priority: optional
 Architecture: ${ARCH}
-Depends: libqt6dbus6, libqt6network6, libqt6svg6, libqt6widgets6
+Depends: libqt6dbus6, libqt6network6, libqt6svg6, libqt6widgets6, xiaomi-sheng-thp (>= 0.3.9)
 Maintainer: siergtc <i@4t.pw>
 Description: Stylus status tray utility
  A Qt tray utility that reports stylus placement and battery level, derives

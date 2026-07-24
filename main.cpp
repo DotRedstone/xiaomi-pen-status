@@ -24,12 +24,15 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QScreen>
+#include <QSettings>
+#include <QSlider>
 #include <QStyleHints>
 #include <QSystemTrayIcon>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QWidget>
 
+#include <array>
 #include <optional>
 
 using BluezInterfaceMap = QMap<QString, QVariantMap>;
@@ -40,6 +43,29 @@ Q_DECLARE_METATYPE(BluezManagedObjects)
 
 static constexpr const char *kDefaultSysfs =
 	"/sys/devices/platform/pmic-glink/pmic_glink.power-supply.0/xiaomi";
+static constexpr const char *kFocusPenProName = "Xiaomi Focus Pen Pro";
+static constexpr const char *kFocusPenCommandUuid =
+	"0000fe11-aa6c-462a-964a-7f2ed5b3e512";
+static constexpr const char *kFocusPenProReadyPath =
+	"/run/xiaomi-sheng-thp/p81c-fe11-ready";
+
+static QByteArray focusPenProPinchLevelCommand(int level)
+{
+	static constexpr std::array<std::array<quint16, 2>, 5> thresholds = {{
+		{{90, 45}}, {{180, 90}}, {{270, 135}}, {{360, 180}}, {{450, 225}},
+	}};
+	const auto values = thresholds.at(
+		static_cast<size_t>(qBound(1, level, 5) - 1));
+	QByteArray command;
+	command.reserve(6);
+	command.append(char(0x5c));
+	command.append(char(0x04));
+	for (quint16 value : values) {
+		command.append(char(value >> 8));
+		command.append(char(value & 0xff));
+	}
+	return command;
+}
 
 struct BluetoothState {
 	bool serviceAvailable = false;
@@ -49,8 +75,11 @@ struct BluetoothState {
 	bool paired = false;
 	bool trusted = false;
 	bool connected = false;
+	bool servicesResolved = false;
+	bool focusPenPro = false;
 	QString adapterPath;
 	QString devicePath;
+	QString commandPath;
 	QString firmwareRevision;
 	QString softwareRevision;
 };
@@ -121,6 +150,10 @@ static BluetoothState readBluetoothState(const QString &address)
 		state.paired = device->value(QStringLiteral("Paired")).toBool();
 		state.trusted = device->value(QStringLiteral("Trusted")).toBool();
 		state.connected = device->value(QStringLiteral("Connected")).toBool();
+		state.servicesResolved =
+			device->value(QStringLiteral("ServicesResolved")).toBool();
+		state.focusPenPro = device->value(QStringLiteral("Name")).toString() ==
+			QString::fromUtf8(kFocusPenProName);
 	}
 
 	if (!state.connected || state.devicePath.isEmpty())
@@ -134,7 +167,10 @@ static BluetoothState readBluetoothState(const QString &address)
 		if (characteristic == object.value().cend())
 			continue;
 		const QString uuid = characteristic->value(QStringLiteral("UUID")).toString();
-		if (uuid.compare(QStringLiteral("00002a26-0000-1000-8000-00805f9b34fb"),
+		if (uuid.compare(QString::fromUtf8(kFocusPenCommandUuid),
+				 Qt::CaseInsensitive) == 0) {
+			state.commandPath = object.key().path();
+		} else if (uuid.compare(QStringLiteral("00002a26-0000-1000-8000-00805f9b34fb"),
 				 Qt::CaseInsensitive) == 0) {
 			state.firmwareRevision = decodeGattText(
 				readGattValue(object.key().path(), *characteristic));
@@ -160,6 +196,14 @@ static std::optional<int> readInt(const QString &path)
 		return std::nullopt;
 
 	return value;
+}
+
+static QString readText(const QString &path)
+{
+	QFile file(path);
+	if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
+		return {};
+	return QString::fromUtf8(file.readAll()).trimmed();
 }
 
 static std::optional<quint32> readHex32(const QString &path)
@@ -512,6 +556,38 @@ public:
 		addDebugRow(debugLayout, 6, QStringLiteral("refresh_rate"), &refreshRateValue);
 		addDebugRow(debugLayout, 7, QStringLiteral("firmware / software"), &versionValue);
 
+		penSettingsGroup = new QGroupBox(
+			trText("Focus Pen Pro 设置", "Focus Pen Pro Settings"));
+		auto *penSettingsLayout = new QGridLayout(penSettingsGroup);
+		penSettingsLayout->setColumnStretch(0, 1);
+		pinchLevelLabel = new QLabel;
+		pinchLevelLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+		pinchLevelSlider = new QSlider(Qt::Horizontal);
+		pinchLevelSlider->setRange(1, 5);
+		pinchLevelSlider->setTickInterval(1);
+		pinchLevelSlider->setTickPosition(QSlider::TicksBelow);
+		pinchLevelSlider->setValue(settings.value(
+			QStringLiteral("focusPenPro/pinchLevel"), 3).toInt());
+		penCommandStatus = new QLabel(
+			trText("等待 Focus Pen Pro 连接", "Waiting for Focus Pen Pro connection"));
+		penCommandStatus->setObjectName(QStringLiteral("summaryLabel"));
+		penCommandStatus->setWordWrap(true);
+		penSettingsLayout->addWidget(new QLabel(
+			trText("轻捏触发力度", "Pinch activation force")), 0, 0);
+		penSettingsLayout->addWidget(pinchLevelLabel, 0, 1);
+		penSettingsLayout->addWidget(pinchLevelSlider, 1, 0, 1, 2);
+		penSettingsLayout->addWidget(penCommandStatus, 2, 0, 1, 2);
+		connect(pinchLevelSlider, &QSlider::valueChanged, this,
+			[this](int) {
+				updatePinchLevelLabel();
+				if (!pinchLevelSlider->isSliderDown())
+					commitPinchLevel();
+			});
+		connect(pinchLevelSlider, &QSlider::sliderReleased, this,
+			[this]() { commitPinchLevel(); });
+		updatePinchLevelLabel();
+		penSettingsGroup->setVisible(false);
+
 		auto *refreshButton = new QPushButton(trText("刷新", "Refresh"));
 		connect(refreshButton, &QPushButton::clicked, this, &PenStatusWindow::refresh);
 
@@ -537,6 +613,7 @@ public:
 		layout->addWidget(summaryLabel);
 		layout->addWidget(batteryPanel);
 		layout->addWidget(warningLabel);
+		layout->addWidget(penSettingsGroup);
 		layout->addWidget(debugGroup);
 
 		trayMenu = new QMenu(this);
@@ -609,6 +686,67 @@ private:
 		const bool dark = isDarkMode();
 		setStyleSheet(makeStyleSheet(dark));
 	}
+
+	void updatePinchLevelLabel()
+	{
+		const int level = pinchLevelSlider->value();
+		const QString name = [&]() {
+			switch (level) {
+			case 1: return trText("极弱", "Extreme weak");
+			case 2: return trText("较弱", "Weak");
+			case 3: return trText("中等", "Medium");
+			case 4: return trText("较强", "Strong");
+			default: return trText("极强", "Extreme strong");
+			}
+		}();
+		pinchLevelLabel->setText(QStringLiteral("%1 · %2").arg(level).arg(name));
+	}
+
+	void commitPinchLevel()
+	{
+		const int level = pinchLevelSlider->value();
+		settings.setValue(QStringLiteral("focusPenPro/pinchLevel"), level);
+		appliedPinchLevel = -1;
+		nextPenCommandAttempt = 0;
+		applyPenSettings();
+	}
+
+	bool writePenCommand(const QByteArray &command)
+	{
+		if (penCommandPath.isEmpty())
+			return false;
+		QDBusInterface characteristic(QStringLiteral("org.bluez"), penCommandPath,
+			QStringLiteral("org.bluez.GattCharacteristic1"),
+			QDBusConnection::systemBus());
+		QVariantMap options;
+		options.insert(QStringLiteral("type"), QStringLiteral("command"));
+		const QDBusReply<void> reply = characteristic.call(
+			QStringLiteral("WriteValue"), command, options);
+		return reply.isValid();
+	}
+
+	void applyPenSettings()
+	{
+		if (penCommandPath.isEmpty() || pinchLevelSlider->isSliderDown())
+			return;
+		const int level = pinchLevelSlider->value();
+		if (appliedPinchLevel == level)
+			return;
+		const qint64 now = QDateTime::currentMSecsSinceEpoch();
+		if (now < nextPenCommandAttempt)
+			return;
+		if (writePenCommand(focusPenProPinchLevelCommand(level))) {
+			appliedPinchLevel = level;
+			penCommandStatus->setText(trText(
+				"已应用轻捏力度：%1", "Pinch force applied: %1").arg(level));
+		} else {
+			penCommandStatus->setText(trText(
+				"轻捏力度下发失败，将自动重试",
+				"Failed to apply pinch force; retrying automatically"));
+			nextPenCommandAttempt = now + 3000;
+		}
+	}
+
 	void addDebugRow(QGridLayout *layout, int row, const QString &name, QLabel **valueLabel)
 	{
 		auto *nameLabel = new QLabel(name);
@@ -746,6 +884,36 @@ private:
 		const std::optional<QString> mac = state.macAddress();
 		const BluetoothState bluetooth = mac ? readBluetoothState(*mac) : BluetoothState{};
 		serviceAutoConnect(mac, bluetooth);
+		const QString readyAddress = readText(
+			QString::fromUtf8(kFocusPenProReadyPath));
+		const bool thpReady = mac && readyAddress.compare(
+			*mac, Qt::CaseInsensitive) == 0;
+		const QString previousCommandPath = penCommandPath;
+		const bool settingsReady = bluetooth.connected && bluetooth.servicesResolved &&
+			bluetooth.focusPenPro && !bluetooth.commandPath.isEmpty() && thpReady;
+		penCommandPath = settingsReady ? bluetooth.commandPath : QString{};
+		penSettingsGroup->setVisible(bluetooth.focusPenPro);
+		penSettingsGroup->setEnabled(settingsReady);
+		setFixedHeight(bluetooth.focusPenPro ? 720 : 600);
+		if (penCommandPath != previousCommandPath) {
+			appliedPinchLevel = -1;
+			nextPenCommandAttempt = 0;
+		}
+		if (bluetooth.focusPenPro && !bluetooth.connected) {
+			penCommandStatus->setText(trText(
+				"等待 Focus Pen Pro 蓝牙连接",
+				"Waiting for Focus Pen Pro Bluetooth connection"));
+		} else if (bluetooth.focusPenPro &&
+			   (!bluetooth.servicesResolved || bluetooth.commandPath.isEmpty())) {
+			penCommandStatus->setText(trText(
+				"等待 Focus Pen Pro 蓝牙服务就绪",
+				"Waiting for Focus Pen Pro Bluetooth services"));
+		} else if (bluetooth.focusPenPro && !thpReady) {
+			penCommandStatus->setText(trText(
+				"等待触控服务完成 Focus Pen Pro 初始化",
+				"Waiting for the touch service to initialize Focus Pen Pro"));
+		}
+		applyPenSettings();
 		QScreen *screen = QGuiApplication::primaryScreen();
 		const qreal refreshRate = screen ? screen->refreshRate() : 0.0;
 		const bool rateKnown = refreshRate > 1.0;
@@ -918,6 +1086,10 @@ private:
 	QLabel *placeErrValue = nullptr;
 	QProgressBar *batteryBar = nullptr;
 	QGroupBox *debugGroup = nullptr;
+	QGroupBox *penSettingsGroup = nullptr;
+	QLabel *pinchLevelLabel = nullptr;
+	QLabel *penCommandStatus = nullptr;
+	QSlider *pinchLevelSlider = nullptr;
 	QSystemTrayIcon *tray = nullptr;
 	QMenu *trayMenu = nullptr;
 	QAction *showAction = nullptr;
@@ -932,6 +1104,11 @@ private:
 	qint64 autoConnectDeadline = 0;
 	qint64 autoConnectAttemptStarted = 0;
 	qint64 nextBluetoothAction = 0;
+	QSettings settings{QStringLiteral("xiaomi-pen-status"),
+			   QStringLiteral("xiaomi-pen-status")};
+	QString penCommandPath;
+	int appliedPinchLevel = -1;
+	qint64 nextPenCommandAttempt = 0;
 	bool allowQuit = false;
 };
 
