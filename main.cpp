@@ -270,6 +270,9 @@ static QString makeStyleSheet(bool dark)
 				background: #f5f6f8;
 				font-size: 14px;
 			}
+			QLabel {
+				background: transparent;
+			}
 			#titleLabel {
 				font-size: 20px;
 				font-weight: 700;
@@ -384,6 +387,9 @@ static QString makeStyleSheet(bool dark)
 			color: #edf0f3;
 			background: #1e2024;
 			font-size: 14px;
+		}
+		QLabel {
+			background: transparent;
 		}
 		#titleLabel {
 			font-size: 20px;
