@@ -1,6 +1,7 @@
 #include <QAction>
 #include <QApplication>
 #include <QCloseEvent>
+#include <QComboBox>
 #include <QDateTime>
 #include <QDBusConnection>
 #include <QDBusInterface>
@@ -22,18 +23,26 @@
 #include <QMenu>
 #include <QPainter>
 #include <QProgressBar>
-#include <QPushButton>
 #include <QScreen>
+#include <QScrollArea>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QSlider>
+#include <QStyle>
 #include <QStyleHints>
 #include <QSystemTrayIcon>
+#include <QTabWidget>
 #include <QTimer>
+#include <QToolButton>
 #include <QVBoxLayout>
 #include <QWidget>
 
 #include <array>
+#include <cstring>
 #include <optional>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
 
 using BluezInterfaceMap = QMap<QString, QVariantMap>;
 using BluezManagedObjects = QMap<QDBusObjectPath, BluezInterfaceMap>;
@@ -48,6 +57,8 @@ static constexpr const char *kFocusPenCommandUuid =
 	"0000fe11-aa6c-462a-964a-7f2ed5b3e512";
 static constexpr const char *kFocusPenProReadyPath =
 	"/run/xiaomi-sheng-thp/p81c-fe11-ready";
+static constexpr const char *kButtonMappingSocket =
+	"/run/xiaomi-sheng-thp/button-mapping.sock";
 
 static QByteArray focusPenProPinchLevelCommand(int level)
 {
@@ -240,17 +251,6 @@ static QIcon appIcon()
 	return QIcon(QStringLiteral(":/icons/xiaomi-pen-status.svg"));
 }
 
-static QIcon transparentWindowIcon()
-{
-	QIcon icon;
-	for (int size : { 16, 22, 24, 32, 48 }) {
-		QPixmap pixmap(size, size);
-		pixmap.fill(Qt::transparent);
-		icon.addPixmap(pixmap);
-	}
-	return icon;
-}
-
 static bool isDarkMode()
 {
 #if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
@@ -266,143 +266,231 @@ static QString makeStyleSheet(bool dark)
 	if (!dark) {
 		return QStringLiteral(R"(
 			QWidget {
-				color: #1f2328;
+				color: #20242a;
+				background: #f5f6f8;
 				font-size: 14px;
 			}
 			#titleLabel {
-				font-size: 18px;
+				font-size: 20px;
 				font-weight: 700;
 			}
 			#stateLabel {
-				font-size: 34px;
-				font-weight: 800;
+				font-size: 28px;
+				font-weight: 700;
 			}
-			#summaryLabel {
-				color: #5f656d;
+			#summaryLabel, #mappingStatus {
+				color: #626a75;
 				font-size: 14px;
 			}
-			#batteryPanel {
-				background: rgba(255, 255, 255, 116);
-				border: 1px solid rgba(120, 116, 108, 82);
+			#statusPanel, #mappingPanel, #pinchPanel, #detailsPanel {
+				background: #ffffff;
+				border: 1px solid #d9dde3;
 				border-radius: 8px;
 			}
-			#captionLabel {
-				color: #74736d;
+			#sectionTitle {
+				font-size: 16px;
+				font-weight: 700;
+			}
+			#captionLabel, #fieldLabel {
+				color: #68717d;
 				font-size: 13px;
-				font-weight: 600;
 			}
 			#batteryNumber {
-				font-size: 42px;
-				font-weight: 800;
+				font-size: 36px;
+				font-weight: 700;
 			}
 			#warningLabel {
-				color: #8a4b00;
-				font-weight: 700;
+				color: #8a5100;
+				background: #fff4df;
+				border: 1px solid #efd6a8;
+				border-radius: 6px;
+				padding: 10px;
 			}
 			QProgressBar {
 				border: 0;
-				border-radius: 5px;
-				background: rgba(80, 78, 72, 44);
+				border-radius: 4px;
+				background: #e4e7eb;
 			}
 			QProgressBar::chunk {
-				border-radius: 5px;
-				background: #1f7a5c;
+				border-radius: 4px;
+				background: #26755c;
 			}
 			QGroupBox {
-				border: 1px solid rgba(120, 116, 108, 82);
+				border: 1px solid #d9dde3;
 				border-radius: 8px;
-				margin-top: 12px;
+				margin-top: 14px;
 				padding: 12px;
-				background: rgba(255, 255, 255, 92);
+				background: #ffffff;
 			}
 			QGroupBox::title {
 				subcontrol-origin: margin;
-				left: 10px;
+				left: 12px;
 				padding: 0 4px;
-				color: #65645f;
+				color: #4e5661;
 				font-weight: 600;
 			}
-			QPushButton {
-				border: 1px solid rgba(120, 116, 108, 92);
+			QComboBox {
+				min-height: 40px;
+				border: 1px solid #cbd0d8;
 				border-radius: 6px;
-				padding: 6px 12px;
-				background: rgba(255, 255, 255, 116);
+				padding: 0 12px;
+				background: #ffffff;
 			}
-			QPushButton:hover {
-				background: rgba(238, 244, 240, 150);
+			QComboBox:hover, QComboBox:focus {
+				border-color: #397b68;
+			}
+			QComboBox QAbstractItemView {
+				background: #ffffff;
+				selection-background-color: #dcece6;
+				selection-color: #20242a;
+			}
+			QToolButton {
+				min-width: 40px;
+				min-height: 40px;
+				border: 0;
+				border-radius: 6px;
+				background: transparent;
+			}
+			QToolButton:hover, QToolButton:pressed {
+				background: #e7eaee;
+			}
+			QTabWidget::pane {
+				border: 0;
+				background: transparent;
+			}
+			QTabBar::tab {
+				min-width: 108px;
+				min-height: 42px;
+				padding: 0 14px;
+				margin-right: 4px;
+				border-radius: 6px;
+				background: transparent;
+				color: #626a75;
+			}
+			QTabBar::tab:selected {
+				background: #e3eee9;
+				color: #1f624f;
+				font-weight: 600;
+			}
+			QScrollArea, QScrollArea > QWidget > QWidget {
+				border: 0;
+				background: transparent;
 			}
 		)");
 	}
 
 	return QStringLiteral(R"(
-		* {
-			color: #e1e5ea;
-		}
 		QWidget {
+			color: #edf0f3;
+			background: #1e2024;
 			font-size: 14px;
 		}
 		#titleLabel {
-			font-size: 18px;
+			font-size: 20px;
 			font-weight: 700;
 		}
 		#stateLabel {
-			font-size: 34px;
-			font-weight: 800;
+			font-size: 28px;
+			font-weight: 700;
 		}
-		#summaryLabel {
-			color: #b4b9c0;
+		#summaryLabel, #mappingStatus {
+			color: #aeb5bf;
 			font-size: 14px;
 		}
-		#batteryPanel {
-			background: rgba(255, 255, 255, 116);
-			border: 1px solid rgba(120, 116, 108, 82);
+		#statusPanel, #mappingPanel, #pinchPanel, #detailsPanel {
+			background: #282b30;
+			border: 1px solid #3d424a;
 			border-radius: 8px;
 		}
-		#captionLabel {
-			color: #bcc0c5;
+		#sectionTitle {
+			font-size: 16px;
+			font-weight: 700;
+		}
+		#captionLabel, #fieldLabel {
+			color: #aeb5bf;
 			font-size: 13px;
-			font-weight: 600;
 		}
 		#batteryNumber {
-			font-size: 42px;
-			font-weight: 800;
+			font-size: 36px;
+			font-weight: 700;
 		}
 		#warningLabel {
-			color: #f0a040;
-			font-weight: 700;
+			color: #f0bd70;
+			background: #3b3021;
+			border: 1px solid #685132;
+			border-radius: 6px;
+			padding: 10px;
 		}
 		QProgressBar {
 			border: 0;
-			border-radius: 5px;
-			background: rgba(80, 78, 72, 44);
+			border-radius: 4px;
+			background: #41464e;
 		}
 		QProgressBar::chunk {
-			border-radius: 5px;
-			background: #1f7a5c;
+			border-radius: 4px;
+			background: #62b99a;
 		}
 		QGroupBox {
-			border: 1px solid rgba(120, 116, 108, 82);
+			border: 1px solid #3d424a;
 			border-radius: 8px;
-			margin-top: 12px;
+			margin-top: 14px;
 			padding: 12px;
-			background: rgba(255, 255, 255, 92);
+			background: #282b30;
 		}
 		QGroupBox::title {
 			subcontrol-origin: margin;
-			left: 10px;
+			left: 12px;
 			padding: 0 4px;
-			color: #bcc0c5;
+			color: #c8cdd4;
 			font-weight: 600;
 		}
-		QPushButton {
-			border: 1px solid rgba(120, 116, 108, 92);
+		QComboBox {
+			min-height: 40px;
+			border: 1px solid #505660;
 			border-radius: 6px;
-			padding: 6px 12px;
-			background: rgba(255, 255, 255, 116);
-			color: #e1e5ea;
+			padding: 0 12px;
+			background: #30343a;
+			color: #edf0f3;
 		}
-		QPushButton:hover {
-			background: rgba(238, 244, 240, 150);
+		QComboBox:hover, QComboBox:focus {
+			border-color: #67a990;
+		}
+		QComboBox QAbstractItemView {
+			background: #30343a;
+			selection-background-color: #36594e;
+			selection-color: #ffffff;
+		}
+		QToolButton {
+			min-width: 40px;
+			min-height: 40px;
+			border: 0;
+			border-radius: 6px;
+			background: transparent;
+		}
+		QToolButton:hover, QToolButton:pressed {
+			background: #353940;
+		}
+		QTabWidget::pane {
+			border: 0;
+			background: transparent;
+		}
+		QTabBar::tab {
+			min-width: 108px;
+			min-height: 42px;
+			padding: 0 14px;
+			margin-right: 4px;
+			border-radius: 6px;
+			background: transparent;
+			color: #aeb5bf;
+		}
+		QTabBar::tab:selected {
+			background: #304b43;
+			color: #8fd2b8;
+			font-weight: 600;
+		}
+		QScrollArea, QScrollArea > QWidget > QWidget {
+			border: 0;
+			background: transparent;
 		}
 	)");
 }
@@ -512,14 +600,15 @@ public:
 		sysfsBase = envPath.isEmpty() ? QString::fromUtf8(kDefaultSysfs)
 					      : QString::fromUtf8(envPath);
 
-		setWindowTitle(trText("手写笔状态", "Stylus Status"));
-		setWindowIcon(transparentWindowIcon());
-		setFixedSize(500, 600);
+		setWindowTitle(trText("小米手写笔", "Xiaomi Focus Pen"));
+		setWindowIcon(appIcon());
+		setMinimumSize(560, 620);
+		resize(620, 720);
 
 		statusDot = new QLabel;
 		statusDot->setFixedSize(12, 12);
 
-		titleLabel = new QLabel(trText("手写笔状态", "Stylus Status"));
+		titleLabel = new QLabel(QStringLiteral("Xiaomi Focus Pen"));
 		titleLabel->setObjectName(QStringLiteral("titleLabel"));
 
 		stateLabel = new QLabel(trText("读取中", "Reading"));
@@ -543,9 +632,14 @@ public:
 		warningLabel = new QLabel;
 		warningLabel->setWordWrap(true);
 		warningLabel->setObjectName(QStringLiteral("warningLabel"));
+		warningLabel->setVisible(false);
 
-		debugGroup = new QGroupBox(trText("调试信息", "Debug"));
+		debugGroup = new QGroupBox(trText("硬件数据", "Hardware data"));
+		debugGroup->setObjectName(QStringLiteral("detailsPanel"));
 		auto *debugLayout = new QGridLayout(debugGroup);
+		debugLayout->setContentsMargins(16, 18, 16, 16);
+		debugLayout->setHorizontalSpacing(18);
+		debugLayout->setVerticalSpacing(12);
 		debugLayout->setColumnStretch(1, 1);
 		addDebugRow(debugLayout, 0, QStringLiteral("pen_tx_ss"), &txSsValue);
 		addDebugRow(debugLayout, 1, QStringLiteral("tx_iout"), &txIoutValue);
@@ -558,6 +652,7 @@ public:
 
 		penSettingsGroup = new QGroupBox(
 			trText("Focus Pen Pro 设置", "Focus Pen Pro Settings"));
+		penSettingsGroup->setObjectName(QStringLiteral("pinchPanel"));
 		auto *penSettingsLayout = new QGridLayout(penSettingsGroup);
 		penSettingsLayout->setColumnStretch(0, 1);
 		pinchLevelLabel = new QLabel;
@@ -588,36 +683,140 @@ public:
 		updatePinchLevelLabel();
 		penSettingsGroup->setVisible(false);
 
-		auto *refreshButton = new QPushButton(trText("刷新", "Refresh"));
-		connect(refreshButton, &QPushButton::clicked, this, &PenStatusWindow::refresh);
+		auto *refreshButton = new QToolButton;
+		refreshButton->setIcon(QIcon::fromTheme(
+			QStringLiteral("view-refresh-symbolic"),
+			style()->standardIcon(QStyle::SP_BrowserReload)));
+		refreshButton->setToolTip(trText("刷新", "Refresh"));
+		refreshButton->setAccessibleName(refreshButton->toolTip());
+		connect(refreshButton, &QToolButton::clicked, this, &PenStatusWindow::refresh);
 
 		auto *header = new QHBoxLayout;
-		header->addWidget(statusDot);
 		header->addWidget(titleLabel, 1);
 		header->addWidget(refreshButton);
 
-		auto *batteryPanel = new QFrame;
-		batteryPanel->setObjectName(QStringLiteral("batteryPanel"));
-		auto *batteryPanelLayout = new QVBoxLayout(batteryPanel);
-		batteryPanelLayout->setContentsMargins(16, 14, 16, 14);
-		batteryPanelLayout->setSpacing(8);
-		batteryPanelLayout->addWidget(batteryCaption);
-		batteryPanelLayout->addWidget(batteryNumber);
-		batteryPanelLayout->addWidget(batteryBar);
+		auto *statusPanel = new QFrame;
+		statusPanel->setObjectName(QStringLiteral("statusPanel"));
+		auto *statusLayout = new QGridLayout(statusPanel);
+		statusLayout->setContentsMargins(18, 18, 18, 18);
+		statusLayout->setHorizontalSpacing(12);
+		statusLayout->setVerticalSpacing(6);
+		statusLayout->addWidget(statusDot, 0, 0, Qt::AlignTop);
+		statusLayout->addWidget(stateLabel, 0, 1);
+		statusLayout->addWidget(summaryLabel, 1, 1);
+		statusLayout->addWidget(batteryCaption, 0, 2, Qt::AlignRight | Qt::AlignBottom);
+		statusLayout->addWidget(batteryNumber, 1, 2, Qt::AlignRight | Qt::AlignTop);
+		statusLayout->addWidget(batteryBar, 2, 0, 1, 3);
+		statusLayout->setColumnStretch(1, 1);
+
+		auto *overviewPage = new QWidget;
+		auto *overviewLayout = new QVBoxLayout(overviewPage);
+		overviewLayout->setContentsMargins(2, 16, 2, 2);
+		overviewLayout->setSpacing(14);
+		overviewLayout->addWidget(statusPanel);
+		overviewLayout->addWidget(warningLabel);
+		overviewLayout->addWidget(penSettingsGroup);
+		overviewLayout->addStretch();
+
+		penPrimaryCombo = new QComboBox;
+		penSecondaryCombo = new QComboBox;
+		airPrimaryCombo = new QComboBox;
+		airSecondaryCombo = new QComboBox;
+		configureActionCombo(penPrimaryCombo,
+			QStringLiteral("buttons/penPrimary"), QStringLiteral("native"));
+		configureActionCombo(penSecondaryCombo,
+			QStringLiteral("buttons/penSecondary"), QStringLiteral("native"));
+		configureActionCombo(airPrimaryCombo,
+			QStringLiteral("buttons/airPrimary"), QStringLiteral("left"));
+		configureActionCombo(airSecondaryCombo,
+			QStringLiteral("buttons/airSecondary"), QStringLiteral("right"));
+
+		auto makeMappingPanel = [this](const QString &title, QComboBox *primary,
+						  QComboBox *secondary) {
+			auto *panel = new QFrame;
+			panel->setObjectName(QStringLiteral("mappingPanel"));
+			auto *panelLayout = new QGridLayout(panel);
+			panelLayout->setContentsMargins(16, 14, 16, 16);
+			panelLayout->setHorizontalSpacing(16);
+			panelLayout->setVerticalSpacing(10);
+			auto *titleLabel = new QLabel(title);
+			titleLabel->setObjectName(QStringLiteral("sectionTitle"));
+			auto *primaryLabel = new QLabel(trText("主按键", "Primary button"));
+			auto *secondaryLabel = new QLabel(trText("副按键", "Secondary button"));
+			primaryLabel->setObjectName(QStringLiteral("fieldLabel"));
+			secondaryLabel->setObjectName(QStringLiteral("fieldLabel"));
+			panelLayout->addWidget(titleLabel, 0, 0, 1, 2);
+			panelLayout->addWidget(primaryLabel, 1, 0);
+			panelLayout->addWidget(primary, 1, 1);
+			panelLayout->addWidget(secondaryLabel, 2, 0);
+			panelLayout->addWidget(secondary, 2, 1);
+			panelLayout->setColumnStretch(1, 1);
+			return panel;
+		};
+
+		mappingStatus = new QLabel;
+		mappingStatus->setObjectName(QStringLiteral("mappingStatus"));
+		mappingStatus->setWordWrap(true);
+		auto *resetButton = new QToolButton;
+		resetButton->setIcon(QIcon::fromTheme(
+			QStringLiteral("edit-undo-symbolic"),
+			style()->standardIcon(QStyle::SP_DialogResetButton)));
+		resetButton->setToolTip(trText("恢复默认按键", "Restore default buttons"));
+		resetButton->setAccessibleName(resetButton->toolTip());
+		connect(resetButton, &QToolButton::clicked, this,
+			[this]() { resetButtonMapping(); });
+
+		auto *mappingFooter = new QHBoxLayout;
+		mappingFooter->addWidget(mappingStatus, 1);
+		mappingFooter->addWidget(resetButton);
+
+		auto *buttonsPage = new QWidget;
+		auto *buttonsLayout = new QVBoxLayout(buttonsPage);
+		buttonsLayout->setContentsMargins(2, 16, 2, 2);
+		buttonsLayout->setSpacing(14);
+		buttonsLayout->addWidget(makeMappingPanel(
+			trText("书写与悬停", "Writing and hover"),
+			penPrimaryCombo, penSecondaryCombo));
+		buttonsLayout->addWidget(makeMappingPanel(
+			trText("空中指针", "Air pointer"),
+			airPrimaryCombo, airSecondaryCombo));
+		buttonsLayout->addLayout(mappingFooter);
+		buttonsLayout->addStretch();
+
+		auto *detailsPage = new QWidget;
+		auto *detailsLayout = new QVBoxLayout(detailsPage);
+		detailsLayout->setContentsMargins(2, 16, 2, 2);
+		detailsLayout->addWidget(debugGroup);
+		detailsLayout->addStretch();
+
+		auto makeScrollPage = [](QWidget *page) {
+			auto *scroll = new QScrollArea;
+			scroll->setWidgetResizable(true);
+			scroll->setFrameShape(QFrame::NoFrame);
+			scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+			scroll->setWidget(page);
+			return scroll;
+		};
+		auto *tabs = new QTabWidget;
+		tabs->setDocumentMode(true);
+		tabs->addTab(makeScrollPage(overviewPage),
+			QIcon::fromTheme(QStringLiteral("input-tablet-symbolic")),
+			trText("概览", "Overview"));
+		tabs->addTab(makeScrollPage(buttonsPage),
+			QIcon::fromTheme(QStringLiteral("preferences-desktop-keyboard-shortcuts-symbolic")),
+			trText("按键", "Buttons"));
+		tabs->addTab(makeScrollPage(detailsPage),
+			QIcon::fromTheme(QStringLiteral("dialog-information-symbolic")),
+			trText("设备", "Device"));
 
 		auto *layout = new QVBoxLayout(this);
-		layout->setContentsMargins(22, 22, 22, 22);
-		layout->setSpacing(14);
+		layout->setContentsMargins(22, 18, 22, 18);
+		layout->setSpacing(8);
 		layout->addLayout(header);
-		layout->addWidget(stateLabel);
-		layout->addWidget(summaryLabel);
-		layout->addWidget(batteryPanel);
-		layout->addWidget(warningLabel);
-		layout->addWidget(penSettingsGroup);
-		layout->addWidget(debugGroup);
+		layout->addWidget(tabs, 1);
 
 		trayMenu = new QMenu(this);
-		showAction = trayMenu->addAction(trText("显示", "Show"));
+		showAction = trayMenu->addAction(trText("打开", "Open"));
 		quitAction = trayMenu->addAction(trText("退出", "Quit"));
 		connect(showAction, &QAction::triggered, this, &PenStatusWindow::showWindow);
 		connect(quitAction, &QAction::triggered, qApp, [this]() {
@@ -680,6 +879,110 @@ protected:
 private:
 	static constexpr qint64 kAutoConnectWindowMs = 30000;
 	static constexpr qint64 kConnectionGraceMs = 10000;
+	static constexpr qint64 kButtonMappingRefreshMs = 5000;
+
+	void configureActionCombo(QComboBox *combo, const QString &settingKey,
+					  const QString &defaultAction)
+	{
+		const std::array<std::pair<const char *, QString>, 11> actions{{
+			{ "native", trText("默认笔按键", "Default pen button") },
+			{ "left", trText("左键单击", "Left click") },
+			{ "right", trText("右键单击", "Right click") },
+			{ "middle", trText("中键单击", "Middle click") },
+			{ "back", trText("返回", "Back") },
+			{ "forward", trText("前进", "Forward") },
+			{ "undo", trText("撤销", "Undo") },
+			{ "redo", trText("重做", "Redo") },
+			{ "screenshot", trText("截图", "Screenshot") },
+			{ "overview", trText("桌面概览", "Desktop overview") },
+			{ "disabled", trText("无操作", "No action") },
+		}};
+		for (const auto &[value, label] : actions)
+			combo->addItem(label, QString::fromLatin1(value));
+		const QString saved = settings.value(settingKey, defaultAction).toString();
+		int index = combo->findData(saved);
+		if (index < 0)
+			index = combo->findData(defaultAction);
+		combo->setCurrentIndex(index);
+		combo->setMinimumWidth(250);
+		connect(combo, qOverload<int>(&QComboBox::currentIndexChanged), this,
+			[this, combo, settingKey](int) {
+				settings.setValue(settingKey, combo->currentData().toString());
+				buttonMappingDirty = true;
+				applyButtonMapping();
+			});
+	}
+
+	QString buttonAction(QComboBox *combo) const
+	{
+		return combo ? combo->currentData().toString() : QStringLiteral("disabled");
+	}
+
+	bool sendButtonMapping() const
+	{
+		const int socketFd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+		if (socketFd < 0)
+			return false;
+		sockaddr_un address{};
+		address.sun_family = AF_UNIX;
+		if (std::strlen(kButtonMappingSocket) >= sizeof(address.sun_path)) {
+			::close(socketFd);
+			return false;
+		}
+		std::strncpy(address.sun_path, kButtonMappingSocket,
+			    sizeof(address.sun_path) - 1);
+		const QByteArray payload = QStringLiteral("map %1 %2 %3 %4\n")
+			.arg(buttonAction(penPrimaryCombo),
+			     buttonAction(penSecondaryCombo),
+			     buttonAction(airPrimaryCombo),
+			     buttonAction(airSecondaryCombo))
+			.toLatin1();
+		const ssize_t written = sendto(socketFd, payload.constData(),
+			static_cast<size_t>(payload.size()), MSG_NOSIGNAL,
+			reinterpret_cast<sockaddr *>(&address), sizeof(address));
+		::close(socketFd);
+		return written == payload.size();
+	}
+
+	void applyButtonMapping()
+	{
+		if (!mappingStatus)
+			return;
+		const qint64 now = QDateTime::currentMSecsSinceEpoch();
+		if (!buttonMappingDirty &&
+		    now - lastButtonMappingAttempt < kButtonMappingRefreshMs)
+			return;
+		lastButtonMappingAttempt = now;
+		if (sendButtonMapping()) {
+			buttonMappingDirty = false;
+			mappingStatus->setText(trText(
+				"按键设置已应用", "Button settings applied"));
+		} else {
+			buttonMappingDirty = true;
+			mappingStatus->setText(trText(
+				"等待触控服务", "Waiting for touch service"));
+		}
+	}
+
+	void resetButtonMapping()
+	{
+		const std::array<std::pair<QComboBox *, QString>, 4> defaults{{
+			{penPrimaryCombo, QStringLiteral("native")},
+			{penSecondaryCombo, QStringLiteral("native")},
+			{airPrimaryCombo, QStringLiteral("left")},
+			{airSecondaryCombo, QStringLiteral("right")},
+		}};
+		for (const auto &[combo, value] : defaults) {
+			const QSignalBlocker blocker(combo);
+			combo->setCurrentIndex(combo->findData(value));
+		}
+		settings.setValue(QStringLiteral("buttons/penPrimary"), QStringLiteral("native"));
+		settings.setValue(QStringLiteral("buttons/penSecondary"), QStringLiteral("native"));
+		settings.setValue(QStringLiteral("buttons/airPrimary"), QStringLiteral("left"));
+		settings.setValue(QStringLiteral("buttons/airSecondary"), QStringLiteral("right"));
+		buttonMappingDirty = true;
+		applyButtonMapping();
+	}
 
 	void updateTheme()
 	{
@@ -880,6 +1183,7 @@ private:
 
 	void refresh()
 	{
+		applyButtonMapping();
 		const PenState state = readState();
 		const std::optional<QString> mac = state.macAddress();
 		const BluetoothState bluetooth = mac ? readBluetoothState(*mac) : BluetoothState{};
@@ -894,7 +1198,6 @@ private:
 		penCommandPath = settingsReady ? bluetooth.commandPath : QString{};
 		penSettingsGroup->setVisible(bluetooth.focusPenPro);
 		penSettingsGroup->setEnabled(settingsReady);
-		setFixedHeight(bluetooth.focusPenPro ? 720 : 600);
 		if (penCommandPath != previousCommandPath) {
 			appliedPinchLevel = -1;
 			nextPenCommandAttempt = 0;
@@ -1003,6 +1306,7 @@ private:
 		}
 
 		warningLabel->setText(warnings.join(QLatin1Char('\n')));
+		warningLabel->setVisible(!warnings.isEmpty());
 		updateDebug(state, mac, bluetooth, refreshRate);
 	}
 
@@ -1089,7 +1393,12 @@ private:
 	QGroupBox *penSettingsGroup = nullptr;
 	QLabel *pinchLevelLabel = nullptr;
 	QLabel *penCommandStatus = nullptr;
+	QLabel *mappingStatus = nullptr;
 	QSlider *pinchLevelSlider = nullptr;
+	QComboBox *penPrimaryCombo = nullptr;
+	QComboBox *penSecondaryCombo = nullptr;
+	QComboBox *airPrimaryCombo = nullptr;
+	QComboBox *airSecondaryCombo = nullptr;
 	QSystemTrayIcon *tray = nullptr;
 	QMenu *trayMenu = nullptr;
 	QAction *showAction = nullptr;
@@ -1109,6 +1418,8 @@ private:
 	QString penCommandPath;
 	int appliedPinchLevel = -1;
 	qint64 nextPenCommandAttempt = 0;
+	qint64 lastButtonMappingAttempt = 0;
+	bool buttonMappingDirty = true;
 	bool allowQuit = false;
 };
 

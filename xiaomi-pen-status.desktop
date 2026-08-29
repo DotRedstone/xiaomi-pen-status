@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=Stylus Status
-Name[zh_CN]=手写笔状态
-Comment=Show stylus power and placement status
-Comment[zh_CN]=显示手写笔电量和放置状态
+Name=Xiaomi Focus Pen
+Name[zh_CN]=小米手写笔
+Comment=Configure buttons and view stylus status
+Comment[zh_CN]=配置手写笔按键并查看设备状态
 Exec=xiaomi-pen-status --show
 Icon=xiaomi-pen-status
 Terminal=false
