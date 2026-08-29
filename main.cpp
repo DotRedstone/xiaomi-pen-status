@@ -839,7 +839,8 @@ public:
 				isVisible() ? hide() : showNormal();
 			}
 		});
-		tray->show();
+		if (QSystemTrayIcon::isSystemTrayAvailable())
+			tray->show();
 
 		timer = new QTimer(this);
 		timer->setInterval(1000);
@@ -1264,7 +1265,8 @@ private:
 		if (state.valid() && state.batteryKnown()) {
 			batteryBar->setValue(*state.soc);
 			batteryNumber->setText(QStringLiteral("%1%").arg(*state.soc));
-			if (state.placed() && !state.misplaced() && !connectedNotified) {
+			if (state.placed() && !state.misplaced() && !connectedNotified &&
+			    tray->isVisible()) {
 				if (mac && !bluetooth.connected) {
 					if (!autoConnectPending()) {
 						tray->showMessage(
